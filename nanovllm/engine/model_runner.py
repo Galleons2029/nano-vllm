@@ -242,11 +242,15 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+        max_num_batched_tokens = self.config.max_num_batched_tokens
+        max_model_len = self.config.max_model_len
+        seq_len = min(max_num_batched_tokens, max_model_len)
         # 计算最大序列数：不超过配置限制
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         # 创建虚拟序列进行预热
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
+        for seq in seqs:
+            seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)  # 执行 prefill
         
         torch.cuda.empty_cache()
@@ -351,34 +355,35 @@ class ModelRunner:
         
         for seq in seqs:
             seqlen = len(seq)
-            # 只添加未缓存的 token（跳过前缀缓存命中的部分）
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            
-            # Q 的长度 = 实际需要计算的 token 数
-            seqlen_q = seqlen - seq.num_cached_tokens
-            # K 的长度 = 总长度（包括缓存的 token）
+            start = min(seq.num_cached_tokens, seqlen - 1)
+            seqlen_q = seq.num_scheduled_tokens
             seqlen_k = seqlen
-            
+            end = start + seqlen_q
+            input_ids.extend(seq[start:end])
+            positions.extend(range(start, end))
+
             # 更新累积长度
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            
+
             # warmup 时没有 block_table
             if not seq.block_table:
                 continue
-            
+
             # 计算 slot_mapping：每个需要计算的 token 对应的 KV 缓存位置
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
+            start_block = start // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size
+            for i in range(start_block, end_block):
+                slot_start = seq.block_table[i] * self.block_size
+                if i == start_block:
+                    slot_start += start % self.block_size
+                if i != end_block - 1:
+                    slot_end = seq.block_table[i] * self.block_size + self.block_size
                 else:
-                    # 最后一个块可能不满
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+                slot_mapping.extend(range(slot_start, slot_end))
         
         # 如果有前缀缓存（K 的总长度 > Q 的总长度），需要 block_tables
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
@@ -445,9 +450,7 @@ class ModelRunner:
         Returns:
             torch.Tensor: 温度参数张量
         """
-        temperatures = []
-        for seq in seqs:
-            temperatures.append(seq.temperature)
+        temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 

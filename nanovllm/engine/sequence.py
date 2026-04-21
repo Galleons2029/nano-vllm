@@ -61,6 +61,7 @@ class Sequence:
         num_tokens (int): 当前总 token 数
         num_prompt_tokens (int): prompt 的 token 数（固定不变）
         num_cached_tokens (int): 已缓存的 token 数（前缀缓存命中）
+        num_scheduled_tokens (int): 本轮被调度执行的 token 数
         block_table (list[int]): KV 缓存块 ID 列表
         temperature (float): 采样温度
         max_tokens (int): 最大生成 token 数
@@ -92,6 +93,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         # 缓存命中的 token 数（prefill 时计算）
         self.num_cached_tokens = 0
+        # 本轮实际要执行的 token 数（chunked prefill / decode 共用）
+        self.num_scheduled_tokens = 0
         # KV 缓存块表
         self.block_table = []
         # 从采样参数复制配置
@@ -179,14 +182,21 @@ class Sequence:
         序列化状态（用于跨进程传输）
         
         优化：只传输必要的数据
-        - 如果还没开始生成（prefill 阶段），传输完整 token_ids
-        - 如果已开始生成（decode 阶段），只传输 last_token
+        - prefill 或重新 prefill 时，需要完整 token_ids
+        - 纯 decode 时只需要最后一个 token
         
         Returns:
             tuple: 序列化的状态数据
         """
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        last_state = self.token_ids if self.num_completion_tokens == 0 or self.num_cached_tokens < self.num_tokens else self.last_token
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            last_state,
+        )
 
     def __setstate__(self, state):
         """
@@ -199,10 +209,12 @@ class Sequence:
         - prefill 阶段需要完整 token_ids 用于计算
         - decode 阶段只需要 last_token 作为输入
         """
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        if self.num_completion_tokens == 0:
-            # prefill 阶段：恢复完整 token_ids
-            self.token_ids = state[-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        if isinstance(last_state, list):
+            # prefill / 重新 prefill：恢复完整 token_ids
+            self.token_ids = last_state
+            self.last_token = self.token_ids[-1]
         else:
-            # decode 阶段：只需要 last_token
-            self.last_token = state[-1]
+            # decode 阶段：只需要最后一个 token
+            self.token_ids = []
+            self.last_token = last_state

@@ -5,9 +5,9 @@ nanovllm/engine/scheduler.py - 请求调度器
 调度器是连接请求管理和模型执行的桥梁。
 
 调度策略概述：
-1. Prefill 优先：如果有等待中的新请求，优先进行 prefill（处理完整 prompt）
-2. Decode 批处理：没有新 prefill 时，对所有运行中的序列进行 decode（生成下一个 token）
-3. 资源约束：受 max_num_seqs 和 max_num_batched_tokens 限制
+1. Prefill 优先：如果有等待中的新请求，优先进行 prefill
+2. Chunked Prefill：当批量 token 预算不足时，只允许首个序列分块 prefill
+3. Decode 批处理：没有新 prefill 时，对运行中的序列统一 decode
 4. 抢占机制：当 KV 缓存不足时，抢占最新的序列释放资源
 
 状态转换图：
@@ -16,7 +16,7 @@ nanovllm/engine/scheduler.py - 请求调度器
        └────(preempt)───────────┘
 
 两阶段推理：
-- Prefill 阶段：处理完整的 prompt，计算所有 token 的 KV cache
+- Prefill 阶段：处理 prompt，并支持将超长 prompt 分多轮完成
 - Decode 阶段：基于已有 KV cache，每次生成一个新 token
 """
 
@@ -87,31 +87,31 @@ class Scheduler:
         3. 如果 KV 缓存不足，会触发抢占机制
         """
         # ==================== Prefill 调度 ====================
-        # 优先处理新请求的 prefill
+        # 优先处理新请求或被抢占后重新进入等待队列的请求
         scheduled_seqs = []
-        num_seqs = 0
         num_batched_tokens = 0
-        
-        while self.waiting and num_seqs < self.max_num_seqs:
+
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
-            
-            # 检查资源约束：
-            # 1. 总 token 数不超过 max_num_batched_tokens
-            # 2. BlockManager 能分配足够的 KV 块
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
-                break  # 资源不足，停止添加更多序列
-            
-            num_seqs += 1
-            # 分配 KV 缓存块（包括前缀缓存查找）
-            self.block_manager.allocate(seq)
-            # 实际需要计算的 token 数 = 总长度 - 缓存命中的 token 数
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
-            # 更新状态为 RUNNING
-            seq.status = SequenceStatus.RUNNING
-            # 从等待队列移到运行队列
-            self.waiting.popleft()
-            self.running.append(seq)
+
+            # 剩余还需要计算的 token 数；decode 前至少保留 1 个 token 进入模型
+            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
+            remaining = self.max_num_batched_tokens - num_batched_tokens
+            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):
+                break
+            # 只允许首个序列做 chunked prefill，避免打散整个批次
+            if remaining < num_tokens and scheduled_seqs:
+                break
+
+            if not seq.block_table:
+                self.block_manager.allocate(seq)
+            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            if seq.num_scheduled_tokens == num_tokens:
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.popleft()
+                self.running.append(seq)
             scheduled_seqs.append(seq)
+            num_batched_tokens += seq.num_scheduled_tokens
         
         # 如果有序列被调度进行 prefill，返回
         if scheduled_seqs:
@@ -119,7 +119,7 @@ class Scheduler:
 
         # ==================== Decode 调度 ====================
         # 没有新的 prefill 任务，对运行中的序列进行 decode
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             
             # 检查是否可以追加新的 KV（可能需要新的块）
@@ -134,7 +134,7 @@ class Scheduler:
                     break
             else:
                 # 成功分配资源，将序列加入本轮调度
-                num_seqs += 1
+                seq.num_scheduled_tokens = 1
                 # 可能需要追加新的 KV 块
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
@@ -167,13 +167,14 @@ class Scheduler:
         # 放到等待队列头部，优先重新调度
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         """
         后处理：更新序列状态，检查是否完成
         
         Args:
             seqs: 本轮执行的序列列表
             token_ids: 对应的采样结果（每个序列一个 token id）
+            is_prefill: 本轮是否为 prefill
         
         处理逻辑：
         1. 将新生成的 token 追加到序列
@@ -181,8 +182,17 @@ class Scheduler:
         3. 如果完成，释放 KV 缓存并从运行队列移除
         """
         for seq, token_id in zip(seqs, token_ids):
-            # 追加新 token
+            if is_prefill:
+                # prefill 只是在补齐已有 prompt 的 KV cache，不一定会立刻生成新 token
+                seq.num_cached_tokens = min(seq.num_cached_tokens + seq.num_scheduled_tokens, seq.num_tokens)
+                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:
+                    seq.num_scheduled_tokens = 0
+                    continue
+
+            # prefill 完成或 decode 阶段，都会真正追加一个新 token
             seq.append_token(token_id)
+            seq.num_cached_tokens += 1
+            seq.num_scheduled_tokens = 0
             
             # 检查是否完成
             # 条件1：遇到 EOS（如果未设置 ignore_eos）

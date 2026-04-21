@@ -69,7 +69,7 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,    # RMSNorm epsilon
         qkv_bias: bool = False,         # QKV 投影是否有偏置
         rope_theta: float = 10000,      # RoPE 基础频率
-        rope_scaling: tuple | None = None,  # RoPE 缩放配置
+        rope_scaling: dict | None = None,  # RoPE 缩放配置
     ) -> None:
         super().__init__()
         
@@ -115,13 +115,17 @@ class Qwen3Attention(nn.Module):
             bias=False,
         )
         
+        # 某些 Qwen 配置会把 rope_theta 嵌在 rope_scaling 中；
+        # 当前实现仍不支持真正的缩放 RoPE，只提取兼容的 theta。
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
+
         # 旋转位置编码
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=rope_scaling,
         )
         
         # Flash Attention 模块

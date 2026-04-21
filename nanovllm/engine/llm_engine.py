@@ -77,6 +77,7 @@ class LLMEngine:
         # 过滤 kwargs，只保留 Config 支持的参数
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        Sequence.block_size = config.kvcache_block_size
         
         # ==================== 2. 多进程初始化（张量并行）====================
         self.ps = []      # 子进程列表
@@ -162,14 +163,14 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         # 执行：前向传播 + 采样
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        # 后处理：追加 token，更新状态
-        self.scheduler.postprocess(seqs, token_ids)
+        # 后处理：更新缓存状态、追加 token、检查完成条件
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
         # 收集已完成序列的输出
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         # 计算吞吐量统计用的 token 数
-        # prefill: 总 token 数（正数）
+        # prefill: 实际调度执行的 token 数（正数）
         # decode: 序列数的负值（负数表示 decode 模式）
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):
